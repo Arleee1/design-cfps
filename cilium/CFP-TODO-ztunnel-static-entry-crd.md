@@ -1,4 +1,4 @@
-# CRD-based ztunnel Enrollment via ClusterStaticEntry
+# CRD-based ztunnel Enrollment via ClusterSPIFFEID
 
 **SIG: SIG-ServiceMesh** ([View all current SIGs](https://docs.cilium.io/en/stable/community/community/#all-sigs))
 
@@ -6,7 +6,7 @@
 
 **Cilium Release:** TBD
 
-**Authors:** Ethan Ermovick <eermovick@microsoft.com>, Karina Ranadive <karanadive@microsoft.com>
+**Authors:** Ethan Ermovick <eermovick@microsoft.com>, Tamilmani Manoharan <tamanoha@microsoft.com>
 
 **Status:** Draft
 
@@ -14,145 +14,64 @@
 
 ## Summary
 
-Currently, the Cilium Operator registers SPIRE entries imperatively through the SPIRE Entry API, and Cilium's bundled SPIRE server stores them in a single SQLite database. With this setup, we cannot have a replicated database for SPIRE registration entries.
+Currently, the Cilium Operator registers SPIRE entries imperatively through the SPIRE Entry API, and Cilium's bundled SPIRE server stores them in a single SQLite database. With this setup, we cannot have multiple redundent databases for SPIRE registration entries.
 
-In this CFP, we propose storing registration intent declaratively. The Cilium Operator records this intent as one `ClusterStaticEntry` custom resource per service account in each namespace enrolled in SPIRE-backed ztunnel mTLS. Kubernetes stores this intent persistently in etcd, which can be replicated. The `spire-controller-manager` then reconciles this intent into the SPIRE datastore through the SPIRE Entry API. Multiple instances of the `spire-controller-manager`, SPIRE server, and datastore can be run for redundancy.
-
-This new dataflow is off by default, but can be enabled by setting `encryption.ztunnel.spire.useCRD=true` in Helm. This setting will also install the `ClusterStaticEntry` CRD and the `spire-controller-manager`.
+In this CFP, we propose storing registration intent declaratively. Instead of storing registration entries directly via the Cilium Operator, we adopt the `spire-controller-manager` setup from [todo]. Upon installation, helm creates a singular `ClusterSPIFFEID` custom resource that defines registration intent. In each spire pod, a `spire-controller-manager` sidecar container reconciles the registration intent with its database. Multiple redundent spire server pods can then reconcile from the single `ClusterSPIFFEID` for high availbitiy.
 
 ## Motivation
 
-The current method of registering SPIRE identities couples the Cilium Operator directly to the SPIRE Entry API. This creates concerns for high availability, because registration entries are stored imperatively, and multiple SPIRE databases cannot be used.
+Currently, the Cilium Operator directly calls the Spire entry API to upsert registrations into the Spire database. The Spire entry API only connects to a single database, so entries are not replicated. This is a single point of failure.
 
-`spire-controller-manager` provides `ClusterStaticEntry` custom resources, a declarative way to store registration intent. The Kubernetes control plane stores these custom resources and can be configured for redundancy. The `spire-controller-manager` then reconciles this intent into a SPIRE database. The main benefit is decoupling the registration intent from the SPIRE database, so the database can be managed independently. With registration intent decoupled, a `spire-controller-manager` paired with each of several redundant SPIRE servers can reconstruct SPIRE registrations from the Kubernetes resources. Even with one SPIRE server, the `spire-controller-manager` can recreate SPIRE entries after a restart that loses the server's datastore.
+The `spire-controller-manager` from [link] provides a solution for this issue. Using this, multiple Spire databases can independently recreate the registration entries, using the intent from the `ClusterSPIFFEID` custom resource, and the current cluster state. Using this system, Spire agents can failover from one Spire pod to another.
 
 ## Goals
 
-* Integrate `spire-controller-manager` and `ClusterStaticEntry` into Cilium's SPIRE install so SPIRE registration is declarative rather than imperative Entry API calls
+* Create a high availibity Spire mtls system for Cilium
 * Gate the declarative registration behind `encryption.ztunnel.spire.useCRD=true` (default false)
-* Keep the existing Entry API path as the default, with no behavior change when the flag is off
-* Only change custom resources owned by the Cilium Operator
-* Make SPIRE Entry API calls from the `spire-controller-manager` rather than the Cilium Operator
+* Leave the current SPIRE path unchanged when `encryption.ztunnel.spire.useCRD=false`
+* Make no SPIRE Entry API calls from the Cilium Operator when the CRD mode is enabled
 * Match the current behavior of creating SPIRE entries
-* Match the structure of the existing Cilium Operator SPIRE client by implementing the [`SpireClient`][spire-client] interface:
-```go
-type SpireClient interface {
-	Upsert(context.Context, string) error
-	UpsertBatch(context.Context, []string) error
-	Delete(context.Context, string) error
-	DeleteBatch(context.Context, []string) error
-	Initialized() <-chan struct{}
-}
-```
-* Implement the optional [`ServiceAccountPruner`][sa-pruner] interface:
-```go
-type ServiceAccountPruner interface {
-	Prune(ctx context.Context, namespace string, keep func(id string) bool) error
-}
-```
 
 ## Non-Goals
 
-* SPIRE agent, Cilium agent, or mTLS datapath changes
-* Trust-root / CA management changes
+* [todo]
 
 ## Proposal
 
 ### Overview
 
+[todo diagram]
 ```mermaid
-flowchart LR
-    OP("Cilium Operator<br/>CRDClient<br/>--enable-ztunnel-spiffeid-crd=true")
-    API("Kubernetes API<br/>ClusterStaticEntry objects<br/>persisted in etcd")
-    SCM("spire-controller-manager")
-    SRV("SPIRE Server<br/>Entry API")
-    DB[("SPIRE datastore<br/>SQLite in bundled deployment")]
-
-    OP -->|"Create / Update / Delete<br/>one CR per ServiceAccount<br/>in an enrolled namespace"| API
-    API -. "Registration intent<br/>via list / watch" .-> SCM
-    SCM -->|"Reconcile registration entries"| SRV
-    SRV -->|"Read / write registrations"| DB
 
 ```
 
-The ztunnel enrollment reconciler already abstracts registration behind a small `SpireClient` interface (`Upsert`, `UpsertBatch`, `Delete`, `DeleteBatch`, `Initialized`). This CFP adds a second implementation of that interface in the SPIRE client package, selected at startup by the new flag, so the interface itself is unchanged. The new client also implements the optional `ServiceAccountPruner` interface. In the new implementation, the Cilium Operator writes `ClusterStaticEntry` resources, and the `spire-controller-manager` reconciles them into SPIRE asynchronously.
+Currently, the Cilium Operator handles registration entries using the Spire Entry API to add entries to the Spire database. The operator updates the entries whenever a change in cluster state (new pods, new namespace enrolled in mtls, etc.) requires it. In this CFP, we propose [todo "removing Cilium Operator registration entry handling" or "adding an option to disable Cilium Operator registration entry handling"]. Instead, we propose making use of the `spire-controller-manager` from [todo link]. The SPIRE Controller Manager project adds multiple components we propose using, including the `ClusterSPIFFEID` and `ClusterStaticEntry` CRDs, and the `spire-controller-manager` sidecar container. Upon installation, helm creates a single `ClusterSPIFFEID` custom resource. This defines registration intent for user managed service accounts. The `ClusterSPIFFEID` provides a template for how registration entries should be created. Additionally, helm creates `ClusterStaticEntries` to store registration intent for static workloads. The `spire-controller-manager` sidecar container runs in the SPIRE server pods. It repeatedly reconciles the registration intent from the `ClusterSPIFFEID` and `ClusterStaticEntries` into a database using the SPIRE Entry API, asynchrounsly. This replaces all Cilium Operator interactions with the SPIRE database. Under this setup, multiple spire servers running `spire-controller-manager` in separate pods can independently create the same SPIRE registration entries, allowing for redundency.
 
-### Operator flag and client wiring
+### UseCRD [todo name] Flag
 
-The feature is gated behind the operator flag [`--enable-ztunnel-spiffeid-crd`][flag-register] (config field [`UseCRD`][config-field], default off). When enabled, [`NewClient`][new-client] selects the new `CRDClient` instead of the existing Entry API client (`EntryClient`). The flag requires `--enable-ztunnel` and `--ztunnel-ca-type=spire`.
+This feature is gated behind the helm flag [todo]. When set to false, there are no changes.
 
-At startup, the CRD client does not wait for a connection to the SPIRE Entry API; `Initialized` is closed as soon as the operator starts. Its methods (`Upsert`, `Delete`, etc.) create, update, and delete `ClusterStaticEntry` resources instead of calling the Entry API.
+### One ClusterSPIFFEID defining registration intent and registration template
 
-### One ClusterStaticEntry per service account in an enrolled namespace
+`ClusterSPIFFEID` [todo link] is a custom resource from the SPIRE Controller Manager Project that serves as both a selector for what pods should have SPIRE entries, and a template for those entries. Registrations created from the `ClusterSPIFFEID` are dynamic based on the cluster state, depending on what pods are in service accounts enrolled in mtls. For example:
 
-For each service account in an enrolled namespace, the backend creates one cluster-scoped `ClusterStaticEntry` custom resource ([`buildClusterStaticEntry`][build-cse]):
+```todo```
 
-```go
-obj.Object["spec"] = map[string]any{
-    "spiffeID":  "spiffe://" + entry.SpiffeId.TrustDomain + entry.SpiffeId.Path,
-    "parentID":  "spiffe://" + entry.ParentId.TrustDomain + entry.ParentId.Path,
-    "selectors": selectors,
-}
-```
+### ClusterStaticEntries for static serviceaccounts
 
-Design points:
+`ClusterStaticEntries` are used for static SPIRE entries, and are set for the below workloads. This replaces bootstrapping by `cilium-init`. These represent SPIRE entries that do not change.
 
-* **One CR per service account:** matches workloads by namespace and service account using the `k8s:ns:<namespace>` and `k8s:sa:<service-account>` selectors, with the explicit SPIFFE ID `spiffe://<trust-domain>/ns/<namespace>/sa/<service-account>`
-* **Parent ID:** `spiffe://<trust-domain>/ztunnel`, the same as the existing Entry API client
-* **Only owned fields are updated:** [`Upsert`][upsert] only mutates the fields the operator owns (`spec.spiffeID`, `spec.parentID`, `spec.selectors`, and the namespace label), and leaves all other fields unchanged
-* **Ownership label:** the operator sets `app.kubernetes.io/managed-by: cilium-operator-ztunnel` on every `ClusterStaticEntry` it creates, along with a `spire.cilium.io/namespace` label and a `spire.cilium.io/service-account` annotation. It only updates or deletes CRs that carry the ownership label, so CRs owned by anything else are not modified
-* **Deterministic, DNS-safe names:** [`crdEntryName`][entry-name] produces `ztunnel-<namespace>.<service-account>`, and falls back to a truncated name plus a SHA-256 hash when that would exceed the 253-character object-name limit
+[todo list]
 
-### Unenrollment cleanup
+### SPIRE Controller Manager Sidecar
 
-When a namespace is unenrolled from SPIRE, the reconciler's [`Delete`][reconciler-delete] calls [`CRDClient.Prune`][crd-prune] for that namespace. `Prune` lists the operator-owned custom resources in the unenrolled namespace and deletes the ones that are no longer desired. The reconciler also runs [`Prune`][reconciler-prune] [every minute][prune-interval] across all namespaces to clean up stale registrations.
-
-Deleting an individual service account removes its associated `ClusterStaticEntry`.
+The `spire-controller-manager` sidecar container runs in each spire server pod. It repeatedly reads the `ClusterSPIFFEID` and `ClusterStaticEntry` resources and reconciles the registrations into a database using the SPIRE Entry API. For the registrations coming from the `ClusterSPIFFEID`, it selects pods based on the selectors in the `ClusterSPIFFEID`, and creates the registration dynamically using the template. For `ClusterStaticEntry` registration entries, it does not depend on the current pods or service accounts etc., and creates them solely based on the static entry resources.
 
 ## Impacts / Key Questions
 
-### Impact: dependency on spire-controller-manager and the CRD
+### Impact: Dependency on SPIRE Controller Manager
 
-This backend only produces SPIRE entries if the `ClusterStaticEntry` CRD is installed and a `spire-controller-manager` is running and reconciling those resources into the SPIRE server. Because Cilium maintains the SPIRE install and includes neither today, enabling this backend requires the following additions to Cilium's SPIRE chart (all gated behind the Helm toggle; with the flag off, none of it is installed and behavior is unchanged):
-
-* **`ClusterStaticEntry` CRD:** install the CRD manifest from the `spire-controller-manager` project
-* **`spire-controller-manager` workload:** deploy it as a sidecar in the existing `spire-server` StatefulSet, sharing the server's API socket `/tmp/spire-server/private/api.sock`. Use the upstream `spiffe/spire-controller-manager` image, configured to watch `ClusterStaticEntry` resources and reconcile them into the co-located server
-* **Controller-manager RBAC:** watch `ClusterStaticEntry` resources and update their status
-* **Validating webhook:** `spire-controller-manager` serves a validating webhook for `ClusterSPIFFEID` and `ClusterFederatedTrustDomain` (not `ClusterStaticEntry`); the chart must either configure it or disable it with `ENABLE_WEBHOOKS=false`
-* **Operator RBAC:** allow the `cilium-operator` service account to get, list, create, update, and delete `ClusterStaticEntry` resources
-* **Flag plumbing:** the Helm value `encryption.ztunnel.spire.useCRD=true` sets `enable-ztunnel-spiffeid-crd` in the operator config and installs the above
-
-The SPIRE server config is otherwise unchanged: the server already exposes the API socket that the controller manager connects to.
-
-### Key Question: Per-namespace vs per-service-account custom resources
-
-For this proposal, the custom resources can represent either the namespaces enrolled in SPIRE mTLS or the service accounts in enrolled namespaces.
-
-### Option 1:
-
-Store one custom resource per service account in an enrolled namespace, as this proposal currently suggests.
-
-#### Pros
-
-* The new CRD-based `SpireClient` matches the existing Entry API client in what its methods (e.g. `Upsert`, `Delete`) do
-* More flexibility for possible future per-service-account SPIRE enrollment
-
-#### Cons
-
-* More custom resources
-
-### Option 2:
-
-Store the enrolled namespaces as custom resources and depend on the `spire-controller-manager` to reconcile which service accounts are enrolled.
-
-#### Pros
-
-* Fewer custom resources
-
-#### Cons
-
-* Greater difference between the new and old `SpireClient` implementations
-* Less flexibility for possible future per-service-account SPIRE enrollment
+This new option requires new custom resource defintions and container images. When this feature is enabled, the `ClusterStaticEntry` and `ClusterSPIFFEID` custom resources must be installed from the SPIRE Controller Manager project, as well as the `spire-controller-manager` sidecar. These are all new dependencies for Cilium, and would only be installed when this feature is enabled in helm.
 
 ### Key Question: High availability via SPIRE CRDs with multiple databases vs a single replicated database
 
