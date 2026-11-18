@@ -75,7 +75,7 @@ This feature is gated behind the Helm value authentication.mutual.spire.ha.enabl
 
 The following new Cilium Operator flag is added:
 
-* `--mesh-auth-spire-ha-bootstrap-entries=<JSON>` supplies Helm-rendered JSON definitions for the two required bootstrap `ClusterStaticEntry` resources: the SPIRE agent node alias and the ztunnel identity. The operator validates these definitions, creates missing resources, and verifies existing resources before workload reconciliation starts. This setting both enables SPIRE HA mode and specifies the bootstrap entries to be created.
+* `--mesh-auth-spire-ha-enabled` this boolean flag sets the Operator to use SPIRE HA mode when set to `true`, with `false` as the default when not set.
 
 ### Changes from Old Datapath
 
