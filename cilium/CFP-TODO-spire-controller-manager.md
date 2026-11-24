@@ -2,9 +2,9 @@
 
 **SIG: SIG-ServiceMesh** ([View all current SIGs](https://docs.cilium.io/en/stable/community/community/#all-sigs))
 
-**Begin Design Discussion:** TBD
+**Begin Design Discussion:** 11/20/2026
 
-**Cilium Release:** TBD
+**Cilium Release:** 1.21
 
 **Authors:** Ethan Ermovick <eermovick@microsoft.com>, Tamilmani Manoharan <tamanoha@microsoft.com>
 
@@ -14,35 +14,29 @@
 
 ## Summary
 
-Currently, the Cilium Operator registers SPIRE entries imperatively through the SPIRE Entry API, and the current bundled deployment uses one SQLite datastore without replication. The bundled server is therefore a single point of failure for certificate issuance: while it is unavailable, new workloads cannot obtain certificates and existing workloads cannot renew them, so mTLS fails for new workloads and for existing workloads whose certificates expire.
+Cilium's new mTLS feature combines ztunnel with SPIRE to issue workload certificates and encrypt traffic. However, a single-replica SPIRE server creates a single point of failure for certificate issuance and renewal. If spire server goes down, new workloads cannot obtain certificates, while existing workloads lose mTLS connectivity once their certificates expire. This proposal highlights the solution to make spire server HA and how to avoid disruption even if one of spire server goes down.
 
-In this CFP, we propose storing registration intent declaratively. The Cilium Operator records this intent as one `ClusterStaticEntry` custom resource per service account in each namespace enrolled in SPIRE-backed ztunnel mTLS. Kubernetes stores this intent persistently in etcd, which can be replicated. The [`spire-controller-manager`][spire-controller-manager] sidecar from the open source [SPIRE Controller Manager Project][spire-controller-manager] then reconciles this intent into the SPIRE datastore through the SPIRE Entry API. Multiple instances of the `spire-controller-manager`, SPIRE server, and datastore can be run for redundancy. Each SPIRE server keeps its own datastore and runs its own controller, which reconciles the same resources into that server only. This reconstructs registrations independently on each server rather than replicating databases. When several servers run, they all chain to one shared upstream root CA, so their certificates validate against the same trust anchor, and agents can move to another server that holds equivalent registrations if their server fails.
-
-This new dataflow is off by default, but can be enabled by setting `authentication.mutual.spire.ha.enabled=true` in Helm. With this setting enabled, Helm deploys the `spire-controller-manager` sidecar; the operator installs or verifies the `ClusterStaticEntry` CRD and creates the `ClusterStaticEntry` resources that store registration intent.
 
 ## Motivation
 
-Currently, the Cilium Operator directly calls the SPIRE Entry API to upsert registrations into the SPIRE database. This server is a single replica with a local SQLite database, which is a single point of failure, so downtime on the SPIRE server lead to gaps in ability to get certs for mtls.
-
-The [SPIRE Controller Manager][spire-controller-manager] project provides a solution for this issue. Using this, multiple SPIRE databases can independently recreate the registration entries, using the intent from ClusterStaticEntry custom resources and the current cluster state. If a SPIRE server fails, a SPIRE agent connected to it can reattest to a different SPIRE server within the same trust domain.
+Currently, SPIRE Server runs as a single replica, and the Cilium Operator calls the SPIRE Entry API directly to upsert workload registrations into its database. A server outage prevents new workloads from registering and obtaining certificates, and existing workloads from renewing theirs. Adding replicas alone is not sufficient: registration state must remain consistent across replicas so that surviving instances can continue issuing and renewing certificates when another replica fails. Each replica maintains its own database, with no mechanism to synchronize state across replicas.
 
 ## Goals
 
-* Make HA SPIRE opt-in with existing behaviour when disabled
-* Decouple the operator's registration intent from individual SPIRE servers
-* Create equivalent SPIRE entries for user workloads in either setting
-* Allow failover to a working SPIRE server if one fails
+* Make Spire server Highly Available. Single replica going down should not disrupt certificate issuance.
+* Allow failover to a working SPIRE server if one fails.
+* Ensure new spire server continue to serve request for new or existing workloads.
 * Ensure workloads trust each other's certificates even when those certificates are issued by different SPIRE server pods
-
 
 ## Non-Goals
 
-* Generating, rotating, or migrating trust-root material. Several servers reference an existing upstream root Secret that the cluster administrator provides
 * Replicating SPIRE agent attestations between servers. An agent that moves to another server re-attests
 * Upgrade from non HA mode to HA mode with uninterrupted traffic
 * Downgrade from HA mode to non HA mode
 
 ## Proposal
+
+This proposal introduces high availability for SPIRE Server through multiple replicas, allowing SPIRE agents to continue accessing the spire service when a replica fails. It leverages OSS project[`spire-controller-manager`][spire-controller-manager] to manage SPIFFE registrations through Kubernetes custom resources and reconcile them with SPIRE Server. Multiple instances of the `spire-controller-manager`, SPIRE server, and datastore can be run for redundancy. Each SPIRE server keeps its own datastore and runs its own controller, which reconciles the same resources into that server only. This reconstructs registrations independently on each server rather than replicating databases. 
 
 ### Overview
 
@@ -51,7 +45,7 @@ The following diagram shows the components with the feature enabled and the defa
 
 ![HA SPIRE registration overview](./images/CFP-TODO-spire-controller-manager-overview.svg)
 
-Currently, the Cilium Operator manages SPIRE registration entries directly through the SPIRE Entry API. With this feature enabled, the Operator will instead manage `ClusterStaticEntry` custom resources from [SPIRE Controller Manager][spire-controller-manager], and no longer interact with the SPIRE Entry API. A `ClusterStaticEntry` defines SPIRE entry registration intent, and the Operator ensures one for every ServiceAccount in an mtls enrolled namespace. In each SPIRE server pod, a `spire-controller-manager` sidecar watches these resources and reconciles them through the SPIRE Entry API into a local SQLite datastore for that SPIRE server pod. It updates its datastore on resource events and at least every 10 seconds. Additionally, at each elected-leader startup, the Cilium Operator creates the `ClusterStaticEntry` CRD if it is missing and ensures the two bootstrap resources (the SPIRE agent node alias and the ztunnel identity, described under Bootstrap ClusterStaticEntries). This removes the need for `cilium-init` in SPIRE HA mode. Multiple SPIRE server pods then independently reconcile the `ClusterStaticEntry`s (which define both the user and bootstrap SPIRE entries) into equivalent registration entries, providing redundancy. Every server's CA chains to one shared upstream root, so that SPIRE agents attested to different SPIRE servers trust each other. SPIRE agents connect to a SPIRE server through the `spire-server` Service, which uses `ClientIP` session affinity when more than one server runs, so that SPIRE agents favor the server they are already using. Nothing copies datastore contents or agent attestations between servers. With multiple SPIRE server pods, if one fails, a SPIRE agent can then failover and reattest to a different working server.
+Currently, the Cilium Operator manages SPIRE registration entries directly through the SPIRE Entry API. With this feature enabled, the Operator will instead manage `ClusterStaticEntry` custom resources from spire-controller-manager, and no longer interact with the SPIRE Entry API. A `ClusterStaticEntry` defines SPIRE entry registration intent, and the Operator ensures one for every ServiceAccount in an mtls enrolled namespace. In each SPIRE server pod, a `spire-controller-manager` sidecar watches these resources and reconciles them through the SPIRE Entry API into a local SQLite datastore for that SPIRE server pod. It updates its datastore on resource events and at least every 10 seconds. Additionally, at each elected-leader startup, the Cilium Operator creates the `ClusterStaticEntry` CRD if it is missing and creates two ClusterStaticEntry resources (the SPIRE agent node alias and the ztunnel identity, described under Bootstrap ClusterStaticEntries). This removes the need for `cilium-init` in SPIRE HA mode. Multiple SPIRE server pods then independently reconcile the `ClusterStaticEntry`s (which define both the user and bootstrap SPIRE entries) into equivalent registration entries, providing redundancy. Every server's CA chains to one shared upstream root, so that SPIRE agents attested to different SPIRE servers trust each other. SPIRE agents connect to a SPIRE server through the `spire-server` Service, which uses `ClientIP` session affinity when more than one server runs, so that SPIRE agents favor the server they are already using. Nothing copies datastore contents or agent attestations between servers. With multiple SPIRE server pods, if one fails, a SPIRE agent can then failover and reattest to a different working server.
 
 ### Prerequisite Helm Flags
 
@@ -71,11 +65,13 @@ This feature is gated behind the Helm value authentication.mutual.spire.ha.enabl
 * `authentication.mutual.spire.ha.enabled=true`
 * `authentication.mutual.spire.ha.replicas=n` defines the number of spire server replicas
 
+This new dataflow is off by default. With HA setting enabled, Helm deploys the `spire-controller-manager` sidecar; the operator installs or verifies the `ClusterStaticEntry` CRD and creates the `ClusterStaticEntry` resources that store registration intent.
+
 ### New Operator Flag
 
 The following new Cilium Operator flag is added:
 
-* `--mesh-auth-spire-ha-enabled` this boolean flag sets the Operator to use SPIRE HA mode when set to `true`, with `false` as the default when not set.
+`--mesh-auth-spire-ha-enabled` this boolean flag sets the Operator to use SPIRE HA mode when set to `true`, with `false` as the default when not set.
 
 ### Changes from Old Datapath
 
@@ -124,25 +120,6 @@ Design points:
 * **Ownership label:** the operator sets `app.kubernetes.io/managed-by: cilium-operator-ztunnel` on every `ClusterStaticEntry` it creates, along with a `spire.cilium.io/namespace` label and a `spire.cilium.io/service-account` annotation. It only updates or deletes CRs that carry the ownership label, so CRs owned by anything else are not modified
 * **No Pod enumeration:** the registration path watches Namespaces and ServiceAccounts only. Desired entries follow those objects, so creating, deleting, or replacing Pods does not change them, and each server holds one entry per enrolled namespace/ServiceAccount pair
 
-### Use Existing Interface for the SPIRE Client in the Operator
-
-The Operator's SPIRE client currently implements the interface below for managing SPIRE entries. In this CFP we continue to use the same interface in the operator client, however the functions now interact with `ClusterStaticEntry`s rather than directly with the SPIRE API.
-```go
-type SpireClient interface {
-	Upsert(context.Context, string) error
-	UpsertBatch(context.Context, []string) error
-	Delete(context.Context, string) error
-	DeleteBatch(context.Context, []string) error
-	Initialized() <-chan struct{}
-}
-```
-We additionally implment the `ServiceAccountPruner` interface, which regularly runs to clean up any stale `ClusterStaticEntry`s. This runs every 10 seconds to ensure that even if the operator is down when a namespace is unenrolled, or a ServiceAccount deleted, the `ClusterStaticEntry`s will still be cleaned up.
-
-```go
-type ServiceAccountPruner interface {
-	Prune(ctx context.Context, namespace string, keep func(id string) bool) error
-}
-```
 
 ### Bootstrap ClusterStaticEntries
 
@@ -181,6 +158,26 @@ spec:
   selectors:
     - k8s:ns:kube-system
     - k8s:sa:ztunnel-cilium
+```
+
+### Use Existing Interface for the SPIRE Client in the Operator
+
+The Operator's SPIRE client currently implements the interface below for managing SPIRE entries. In this CFP we continue to use the same interface in the operator client, however the functions now interact with `ClusterStaticEntry`s rather than directly with the SPIRE API.
+```go
+type SpireClient interface {
+	Upsert(context.Context, string) error
+	UpsertBatch(context.Context, []string) error
+	Delete(context.Context, string) error
+	DeleteBatch(context.Context, []string) error
+	Initialized() <-chan struct{}
+}
+```
+We additionally implment the `ServiceAccountPruner` interface, which regularly runs to clean up any stale `ClusterStaticEntry`s. This runs every 10 seconds to ensure that even if the operator is down when a namespace is unenrolled, or a ServiceAccount deleted, the `ClusterStaticEntry`s will still be cleaned up.
+
+```go
+type ServiceAccountPruner interface {
+	Prune(ctx context.Context, namespace string, keep func(id string) bool) error
+}
 ```
 
 ### Unenrollment cleanup
