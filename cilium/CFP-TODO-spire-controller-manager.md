@@ -14,18 +14,18 @@
 
 ## Summary
 
-Cilium's new mTLS feature combines ztunnel with SPIRE to issue workload certificates and encrypt traffic. However, a single-replica SPIRE server creates a single point of failure for certificate issuance and renewal. If spire server goes down, new workloads cannot obtain certificates, while existing workloads lose mTLS connectivity once their certificates expire. This proposal highlights the solution to make spire server HA and how to avoid disruption even if one of spire server goes down.
+Cilium's new mTLS feature combines ztunnel with SPIRE to issue workload certificates and encrypt traffic. However, a single-replica SPIRE server creates a single point of failure for certificate issuance and renewal. If the spire server goes down, new workloads cannot obtain certificates, while existing workloads lose mTLS connectivity once their certificates expire. This proposal gives a solution to make the spire server HA and avoid disruption even if one spire server goes down.
 
 
 ## Motivation
 
-Currently, SPIRE Server runs as a single replica, and the Cilium Operator calls the SPIRE Entry API directly to upsert workload registrations into its database. A server outage prevents new workloads from registering and obtaining certificates, and existing workloads from renewing theirs. Adding replicas alone is not sufficient: registration state must remain consistent across replicas so that surviving instances can continue issuing and renewing certificates when another replica fails. Each replica maintains its own database, with no mechanism to synchronize state across replicas.
+Currently, the SPIRE Server runs as a single replica, and the Cilium Operator calls the SPIRE Entry API directly to upsert workload registrations into its database. A server outage prevents new workloads from registering and obtaining certificates, and existing workloads from renewing theirs. Adding replicas alone is not sufficient: registration state must remain consistent across replicas so that surviving instances can continue issuing and renewing certificates when another replica fails. Each replica maintains its own database, with no mechanism to synchronize state across replicas.
 
 ## Goals
 
-* Make Spire server Highly Available. Single replica going down should not disrupt certificate issuance.
+* Make the Spire server Highly Available. A single replica going down should not disrupt certificate issuance.
 * Allow failover to a working SPIRE server if one fails.
-* Ensure new spire server continue to serve request for new or existing workloads.
+* Ensure new spire servers continue to serve requests for new or existing workloads.
 * Ensure workloads trust each other's certificates even when those certificates are issued by different SPIRE server pods
 
 ## Non-Goals
@@ -36,7 +36,7 @@ Currently, SPIRE Server runs as a single replica, and the Cilium Operator calls 
 
 ## Proposal
 
-This proposal introduces high availability for SPIRE Server through multiple replicas, allowing SPIRE agents to continue accessing the spire service when a replica fails. It leverages OSS project[`spire-controller-manager`][spire-controller-manager] to manage SPIFFE registrations through Kubernetes custom resources and reconcile them with SPIRE Server. Multiple instances of the `spire-controller-manager`, SPIRE server, and datastore can be run for redundancy. Each SPIRE server keeps its own datastore and runs its own controller, which reconciles the same resources into that server only. This reconstructs registrations independently on each server rather than replicating databases. 
+This proposal introduces high availability for SPIRE Server through multiple replicas, allowing SPIRE agents to continue accessing the spire service when a replica fails. It leverages OSS project[`spire-controller-manager`][spire-controller-manager] to manage SPIFFE registrations through Kubernetes custom resources and reconcile them into the SPIRE Server. Multiple instances of the `spire-controller-manager`, SPIRE server, and datastore can be run for redundancy. Each SPIRE server keeps its own datastore and runs its own controller, which reconciles the same resources into that server only. This reconstructs registrations independently on each server rather than replicating databases. 
 
 ### Overview
 
@@ -65,13 +65,11 @@ This feature is gated behind the Helm value authentication.mutual.spire.ha.enabl
 * `authentication.mutual.spire.ha.enabled=true`
 * `authentication.mutual.spire.ha.replicas=n` defines the number of spire server replicas
 
-This new dataflow is off by default. With HA setting enabled, Helm deploys the `spire-controller-manager` sidecar; the operator installs or verifies the `ClusterStaticEntry` CRD and creates the `ClusterStaticEntry` resources that store registration intent.
+This new dataflow is off by default. With the HA setting enabled, Helm deploys the `spire-controller-manager` sidecar; the operator installs or verifies the `ClusterStaticEntry` CRD and creates the `ClusterStaticEntry` resources that store registration intent.
 
 ### New Operator Flag
 
-The following new Cilium Operator flag is added:
-
-`--mesh-auth-spire-ha-enabled` this boolean flag sets the Operator to use SPIRE HA mode when set to `true`, with `false` as the default when not set.
+`--mesh-auth-spire-ha-enabled` is a boolean flag added to the Operator that enables HA mode only when set to `true`.
 
 ### Changes from Old Datapath
 
@@ -172,7 +170,7 @@ type SpireClient interface {
 	Initialized() <-chan struct{}
 }
 ```
-We additionally implment the `ServiceAccountPruner` interface, which regularly runs to clean up any stale `ClusterStaticEntry`s. This runs every 10 seconds to ensure that even if the operator is down when a namespace is unenrolled, or a ServiceAccount deleted, the `ClusterStaticEntry`s will still be cleaned up.
+We additionally implement the `ServiceAccountPruner` interface, which regularly runs to clean up any stale `ClusterStaticEntry`s. This runs every 10 seconds to ensure that even if the operator is down when a namespace is unenrolled, or a ServiceAccount deleted, the `ClusterStaticEntry`s will still be cleaned up.
 
 ```go
 type ServiceAccountPruner interface {
